@@ -1,0 +1,52 @@
+/* adminPage.css — was empty, now provides dashboard-specific overrides */
+
+/* Ensure the page fills height without scrollbar flicker */
+html { overflow-y: scroll; }
+
+/* Smooth page transitions */
+.page-body { animation: fadeIn .25s ease both; }
+@keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+
+/* Section cards hover glow */
+.section-card { transition: border-color .2s; }
+.section-card:hover { border-color: var(--border-hi); }
+
+/* Stat card accent border-left on hover */
+.stat-card { transition: border-color .2s, box-shadow .2s; }
+.stat-card:hover {
+  border-color: rgba(200,168,75,.3);
+  box-shadow: 0 0 0 1px rgba(200,168,75,.08);
+}
+
+/* Table row transition */
+.data-table tr { transition: background .1s; }
+
+/* Form inputs smooth focus ring */
+.field input, .field select, .field textarea { transition: border-color .15s, box-shadow .2s; }
+
+/* Readonly inputs visually distinct */
+.field input[readonly] { opacity: .7; }
+
+/* Alert slide-in */
+.alert { animation: slideDown .2s ease both; }
+@keyframes slideDown { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: none; } }
+
+/* RFID tag chip style */
+.rfid-box { transition: border-color .2s; }
+.rfid-box:hover { border-color: rgba(200,168,75,.3); }
+
+/* Back link arrow animation */
+.back-link:hover { gap: 10px; }
+
+/* Mobile fallback (though desktop-only per brief) */
+@media (max-width: 900px) {
+  .stats-grid { grid-template-columns: 1fr 1fr; }
+  .form-grid  { grid-template-columns: 1fr 1fr; }
+  .container  { padding: 20px 16px; }
+}
+@media (max-width: 600px) {
+  .stats-grid { grid-template-columns: 1fr; }
+  .form-grid  { grid-template-columns: 1fr; }
+  .site-header { padding: 0 16px; gap: 12px; }
+  .header-nav { display: none; }
+}
