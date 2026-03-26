@@ -19,4 +19,4 @@
 >
 > In the [HARDWARE](esp8266) Folder includes all the stuff / code related to the microcontroller **( ESP8266 )**
 >
-> And in the [BACKEND](BACKEND) Folder Includes all the code to the API
+> And in the Folder apart from "esp8266" Includes all the code to the API and frontend.
