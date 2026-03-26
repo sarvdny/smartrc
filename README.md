@@ -6,7 +6,7 @@
   > - **Sarvdny Potfode [ SY D-11 ]**
   > - **Siraj Sayed [ SY D-12 ]**
   > - **Nandini Panchal [ SY D-13 ]**
-  > - **Priti Satvekar [ SY D-1 ]**
+  > - **Priti Satvekar [ SY D-14 ]**
 
 >
 
