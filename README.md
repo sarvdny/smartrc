@@ -17,6 +17,6 @@
 
 > **This Repository includes the programs of both, Hardware as well as The Software.**
 >
-> In the [HARDWARE](ESP8266) Folder includes all the stuff / code related to the microcontroller **( ESP8266 )**
+> In the [HARDWARE](esp8266) Folder includes all the stuff / code related to the microcontroller **( ESP8266 )**
 >
 > And in the [BACKEND](BACKEND) Folder Includes all the code to the API
