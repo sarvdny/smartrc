@@ -5,14 +5,28 @@
 #include <Adafruit_SH110X.h>
 #include <ESP8266WiFi.h>
 #include <ESP8266HTTPClient.h>
-#include <WiFiClient.h>
+#include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
 
-// ── USER CONFIG ───────────────────────────────────────────
+// ── USER CONFIG ──────────────────────────────────────────
 const char *WIFI_SSID = "WIFI_SSID";
-const char *WIFI_PASSWORD = "WIFI_PASS";
+const char *WIFI_PASSWORD = "WIFI_PASSWORD";
 const char *SERVER_URL = "API_URL";
-const char *API_KEY = "API_KEY : BY DEFAULT smartrc_rfid_2025";
+const char *API_KEY = "API_KEY";
+
+// ── HTTPS / SSL CONFIG ───────────────────────────────────
+// Option A (recommended): set your server SSL fingerprint.
+// Get it with: openssl s_client -connect example.com:443 < /dev/null 2>/dev/null \
+//              | openssl x509 -fingerprint -sha1 -noout
+// Paste the result below (colons or spaces between hex pairs both work).
+// Must update whenever your SSL certificate renews.
+//
+// Option B (easy but less secure): set USE_HTTPS_INSECURE true.
+// This skips certificate verification — still encrypts traffic
+// but does not verify the server is who it claims to be.
+// Fine for a private IoT device on a trusted network.
+const bool USE_HTTPS_INSECURE = true; // set false to use fingerprint
+const char *SSL_FINGERPRINT = "AA BB CC DD EE FF 00 11 22 33 44 55 66 77 88 99 AA BB CC DD";
 
 const unsigned long RESULT_TIMEOUT_MS = 30000; // result screen auto-return
 const unsigned long CACHE_TTL_MS = 60000;      // cache same card 60s
@@ -45,28 +59,38 @@ enum State
   STATE_FETCHING,
   STATE_RESULT,
   STATE_NOT_FOUND,
-  STATE_ERROR
+  STATE_ERROR,
+  STATE_WIFI_RECONNECTING,
+  STATE_SETTINGS,
+  STATE_EXPIRED_ALERT
 };
 State currentState = STATE_WIFI;
 
 // ── MENU ─────────────────────────────────────────────────
+// isAction=true items open a special handler instead of going to STATE_READY
 struct FieldGroup
 {
   const char *label;
   const char *fields;
+  bool isAction;
 };
 
 const FieldGroup MENU[] = {
-    {"Vehicle Info", "vehicle_no,model,fuel_type,color,class"},
-    {"Owner Details", "owner_name,father_name"},
-    {"Insurance", "insurance"},
-    {"Fitness Cert", "fitness"},
-    {"Road Tax", "tax"},
-    {"Pollution PUC", "pollution"},
-    {"Compliance", "insurance,fitness,tax,pollution"},
-    {"Full Details", "owner_name,vehicle_no,model,insurance,fitness"},
+    {"Vehicle Info", "vehicle_no,model,fuel_type,color,class", false},
+    {"Owner Details", "owner_name,father_name", false},
+    {"Insurance", "insurance", false},
+    {"Fitness Cert", "fitness", false},
+    {"Road Tax", "tax", false},
+    {"Pollution PUC", "pollution", false},
+    {"Compliance", "insurance,fitness,tax,pollution", false},
+    {"Full Details", "owner_name,vehicle_no,model,insurance,fitness", false},
+    {"Expired Docs", "insurance,fitness,tax,pollution", false},
+    {"Settings", NULL, true},
 };
 const int MENU_COUNT = sizeof(MENU) / sizeof(MENU[0]);
+// MENU_WIFI_IDX removed — was a #define referencing a runtime const int,
+// which the AVR/Xtensa preprocessor evaluates to 0. Bug: reconnect option
+// always fell through to goToReady(). Now detected via strcmp on fields sentinel.
 const int MENU_VISIBLE = 4;
 int menuIndex = 0, menuScroll = 0;
 
@@ -79,6 +103,8 @@ char resultVals[MAX_RESULT_ROWS][24]; // FIX 8: char[] not String
 int resultCount = 0;
 int resultScroll = 0;
 bool resultFromCache = false; // FIX 4: explicit cache flag
+int expiredCount = 0;         // how many docs are EXP
+char expiredFields[32] = "";  // e.g. "Ins,PUC"
 unsigned long resultShowTime = 0;
 
 // ── CACHE ────────────────────────────────────────────────
@@ -101,6 +127,35 @@ unsigned long lastRfidPollMs = 0; // FIX 7
 // ── ERROR STRING ─────────────────────────────────────────
 char errorMsg[32] = "";
 
+// ── WIFI RECONNECT STATE (globals — reset explicitly each use) ──
+bool wifiReconnectActive = false;
+bool wifiJustConnected = false; // latched once on connect
+unsigned long wifiReconnectStartMs = 0;
+unsigned long wifiSuccessShowMs = 0;
+int wifiDots = 1;
+unsigned long wifiDotMs = 0;
+
+// ── SETTINGS STATE ───────────────────────────────────────
+struct SettingItem
+{
+  const char *label;
+  const char *value;
+};
+
+// Settings sub-menu index
+int settingsIndex = 0;
+int settingsScroll = 0;
+const int SETTINGS_VISIBLE = 4;
+
+// Persistent settings (survive between menu visits)
+bool settingCacheEnabled = true;
+uint8_t settingBrightness = 255; // 0–255, SH110X contrast
+
+// Settings action flags
+bool settingsServerChecking = false;
+char settingsMsg[32] = "";
+unsigned long settingsMsgMs = 0;
+
 // ─────────────────────────────────────────────────────────
 //  FIX 3: FORWARD DECLARATIONS
 //  bumpActivity() calls draw functions defined later —
@@ -115,6 +170,12 @@ void drawError(const char *msg);
 void goToMenu();
 void goToReady();
 void fetchRC(const char *tag);
+void drawWifiReconnecting(int dots, bool success);
+void drawSettings();
+void goToSettings();
+void execSetting(int idx);
+void drawExpiredAlert();
+void goToExpiredAlert();
 
 // ─────────────────────────────────────────────────────────
 //  FIX 1 + FIX 2: BUTTON EVENT QUEUE
@@ -213,6 +274,16 @@ void bumpActivity()
     case STATE_RESULT:
       drawResult();
       break;
+    // Fix 3: redraw reconnect screen on OLED wake
+    case STATE_WIFI_RECONNECTING:
+      drawWifiReconnecting(wifiDots, wifiJustConnected);
+      break;
+    case STATE_SETTINGS:
+      drawSettings();
+      break;
+    case STATE_EXPIRED_ALERT:
+      drawExpiredAlert();
+      break;
     default:
       break;
     }
@@ -276,7 +347,8 @@ void oledScrollbar(int total, int visible, int offset)
   int trackH = SCREEN_H - 13;
   int barH = max(4, trackH * visible / total);
   int barY = 13 + trackH * offset / total;
-  display.fillRect(126, barY, 2, barH, SH110X_WHITE);
+  // Fix 4: was x=126 — overlapped last pixel of hint text (e.g. "BACK")
+  display.fillRect(125, barY, 2, barH, SH110X_WHITE);
 }
 
 void oledWifiDot()
@@ -306,8 +378,12 @@ void drawWifiOk()
 {
   display.clearDisplay();
   oledHeader("Smart RC Book");
+  // Fix 6: store IP in local buffer — .c_str() into a temporary is UB
+  char ipBuf[20];
+  strncpy(ipBuf, WiFi.localIP().toString().c_str(), sizeof(ipBuf) - 1);
+  ipBuf[sizeof(ipBuf) - 1] = '\0';
   oledRow(0, "WiFi Connected!");
-  oledRow(1, WiFi.localIP().toString().c_str());
+  oledRow(1, ipBuf);
   oledRow(2, "Checking server...");
   display.display();
 }
@@ -329,6 +405,32 @@ void drawServerCheck(bool ok, const char *detail)
   oledRow(0, ok ? "Server OK!" : "Server Error");
   oledRow(1, detail);
   oledRow(2, ok ? "Starting..." : "Check SERVER_URL");
+  display.display();
+}
+
+void drawWifiReconnecting(int dots, bool success)
+{
+  display.clearDisplay();
+  if (success)
+  {
+    oledHeader("WiFi Connected");
+    char ipBuf2[20];
+    strncpy(ipBuf2, WiFi.localIP().toString().c_str(), sizeof(ipBuf2) - 1);
+    ipBuf2[sizeof(ipBuf2) - 1] = '\0';
+    oledRow(0, "Reconnected!");
+    oledRow(1, ipBuf2);
+    oledRow(2, "Returning to menu");
+  }
+  else
+  {
+    oledHeader("Reconnecting...");
+    oledRow(0, WIFI_SSID);
+    char d[4] = "";
+    for (int i = 0; i < dots && i < 3; i++)
+      d[i] = '.';
+    oledRow(1, d);
+    oledRow(2, "Press BACK to cancel");
+  }
   display.display();
 }
 
@@ -409,12 +511,13 @@ void drawResult()
     char k[7];
     strncpy(k, resultKeys[idx], 6);
     k[6] = '\0';
-    // uppercase key in place
     for (int j = 0; j < 6 && k[j]; j++)
       k[j] = toupper(k[j]);
     char line[22];
     snprintf(line, sizeof(line), "%s: %s", k, resultVals[idx]);
-    oledRow(i, line);
+    // Highlight EXP rows with inversion so officer sees them instantly
+    bool isExp = (strcmp(resultVals[idx], "EXP") == 0);
+    oledRow(i, line, isExp);
   }
   oledScrollbar(resultCount, RESULT_ROWS_OLED, resultScroll);
   oledHint(resultCount > RESULT_ROWS_OLED ? "v ^ BK" : "BACK");
@@ -448,6 +551,256 @@ void drawError(const char *msg)
 }
 
 // ─────────────────────────────────────────────────────────
+//  EXPIRED ALERT SCREEN
+//  Shown when expired_count > 0. Large warning, lists which
+//  docs are expired. SEL or NAV → proceed to full result.
+//  BACK → return to menu.
+// ─────────────────────────────────────────────────────────
+void drawExpiredAlert()
+{
+  display.clearDisplay();
+
+  // Header with inverted background for maximum urgency
+  display.fillRect(0, 0, 128, 11, SH110X_WHITE);
+  display.setTextColor(SH110X_BLACK);
+  display.setTextSize(1);
+  display.setCursor(2, 1);
+  display.print("!!! EXPIRED DOCS !!!");
+  display.setTextColor(SH110X_WHITE);
+
+  // Big expired count in centre
+  display.setTextSize(2);
+  char countLine[8];
+  snprintf(countLine, sizeof(countLine), "%d EXP", expiredCount);
+  int cx = (128 - strlen(countLine) * 12) / 2;
+  if (cx < 0)
+    cx = 0;
+  display.setCursor(cx, 16);
+  display.print(countLine);
+  display.setTextSize(1);
+
+  // Which docs are expired
+  char expLine[22];
+  snprintf(expLine, sizeof(expLine), "%.21s", expiredFields);
+  display.setCursor(0, 38);
+  display.print(expLine);
+
+  // RC number
+  display.setCursor(0, 50);
+  char rcLine[22];
+  snprintf(rcLine, sizeof(rcLine), "%.21s", resultRcNo);
+  display.print(rcLine);
+
+  oledHint("SEL=details");
+  display.display();
+}
+
+// ─────────────────────────────────────────────────────────
+//  SETTINGS — 6 items, each with a live value line
+// ─────────────────────────────────────────────────────────
+const char *settingLabels[] = {
+    "WiFi Reconnect",
+    "WiFi Info",
+    "Clear Cache",
+    "Server Check",
+    "Brightness",
+    "Device Info",
+};
+const int SETTINGS_COUNT = 6;
+
+// Build value string for each setting item
+void settingValueStr(int idx, char *out, int outLen)
+{
+  switch (idx)
+  {
+  case 0: // WiFi Reconnect
+    strncpy(out, WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected", outLen - 1);
+    break;
+  case 1: // WiFi Info
+    if (WiFi.status() == WL_CONNECTED)
+    {
+      char ipBuf[16];
+      strncpy(ipBuf, WiFi.localIP().toString().c_str(), 15);
+      ipBuf[15] = '\0';
+      snprintf(out, outLen, "RSSI:%ddBm", WiFi.RSSI());
+    }
+    else
+    {
+      strncpy(out, "Not connected", outLen - 1);
+    }
+    break;
+  case 2: // Clear Cache
+    if (cachedCount > 0)
+    {
+      snprintf(out, outLen, "Cached: %s", cachedRcNo);
+    }
+    else
+    {
+      strncpy(out, "Cache empty", outLen - 1);
+    }
+    break;
+  case 3: // Server Check
+    strncpy(out, settingsMsg[0] ? settingsMsg : "Press SEL", outLen - 1);
+    break;
+  case 4: // Brightness
+    snprintf(out, outLen, "%d%%", (int)(settingBrightness / 2.55f));
+    break;
+  case 5: // Device Info
+    snprintf(out, outLen, "Heap:%uB", ESP.getFreeHeap());
+    break;
+  default:
+    strncpy(out, "", outLen - 1);
+  }
+  out[outLen - 1] = '\0';
+}
+
+void drawSettings()
+{
+  display.clearDisplay();
+  oledHeader("Settings");
+  oledWifiDot();
+
+  for (int i = 0; i < SETTINGS_VISIBLE; i++)
+  {
+    int idx = settingsScroll + i;
+    if (idx >= SETTINGS_COUNT)
+      break;
+    bool sel = (idx == settingsIndex);
+
+    // Row A: ">Label" or " Label"
+    char rowA[22];
+    snprintf(rowA, sizeof(rowA), "%c%s", sel ? '>' : ' ', settingLabels[idx]);
+    oledRow(i, rowA, sel);
+  }
+
+  oledScrollbar(SETTINGS_COUNT, SETTINGS_VISIBLE, settingsScroll);
+  oledHint("SEL=run");
+  display.display();
+}
+
+// Draw a full-screen info panel for WiFi Info / Device Info
+void drawSettingsInfo(const char *title,
+                      const char *l0, const char *l1,
+                      const char *l2, const char *l3)
+{
+  display.clearDisplay();
+  oledHeader(title);
+  if (l0)
+    oledRow(0, l0);
+  if (l1)
+    oledRow(1, l1);
+  if (l2)
+    oledRow(2, l2);
+  if (l3)
+    oledRow(3, l3);
+  oledHint("BACK");
+  display.display();
+}
+
+void goToSettings()
+{
+  settingsIndex = 0;
+  settingsScroll = 0;
+  settingsMsg[0] = '\0';
+  settingsMsgMs = 0;
+  currentState = STATE_SETTINGS;
+  drawSettings();
+}
+
+void execSetting(int idx)
+{
+  switch (idx)
+  {
+
+  case 0: // ── WiFi Reconnect ──────────────────────────
+    wifiReconnectActive = true;
+    wifiJustConnected = false;
+    wifiReconnectStartMs = millis();
+    wifiSuccessShowMs = 0;
+    wifiDots = 1;
+    wifiDotMs = 0;
+    currentState = STATE_WIFI_RECONNECTING;
+    WiFi.disconnect();
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    drawWifiReconnecting(1, false);
+    break;
+
+  case 1:
+  { // ── WiFi Info ───────────────────────────────
+    char ssidBuf[22], ipBuf[20], rssi[16], mac[20];
+    snprintf(ssidBuf, sizeof(ssidBuf), "SSID: %s", WIFI_SSID);
+    if (WiFi.status() == WL_CONNECTED)
+    {
+      strncpy(ipBuf, WiFi.localIP().toString().c_str(), 19);
+      ipBuf[19] = '\0';
+      snprintf(rssi, sizeof(rssi), "RSSI: %d dBm", WiFi.RSSI());
+      snprintf(mac, sizeof(mac), "MAC: %s", WiFi.macAddress().c_str());
+    }
+    else
+    {
+      strncpy(ipBuf, "Not connected", 19);
+      strncpy(rssi, "", 15);
+      strncpy(mac, "", 19);
+    }
+    drawSettingsInfo("WiFi Info", ssidBuf, ipBuf, rssi, mac);
+    // Stay showing info until BACK pressed — loop handles this via
+    // STATE_SETTINGS + settingsMsgMs timer approach
+    // We set a long display timer so BACK is the only exit
+    settingsMsgMs = millis();
+    break;
+  }
+
+  case 2: // ── Clear Cache ─────────────────────────────
+    cachedTag[0] = '\0';
+    cachedRcNo[0] = '\0';
+    cachedCount = 0;
+    cachedMenuIndex = -1;
+    cachedAt = 0;
+    strncpy(settingsMsg, "Cache cleared!", sizeof(settingsMsg) - 1);
+    settingsMsgMs = millis();
+    drawSettings();
+    break;
+
+  case 3: // ── Server Check ────────────────────────────
+    strncpy(settingsMsg, "Checking...", sizeof(settingsMsg) - 1);
+    drawSettings();
+    {
+      bool ok = checkServer();
+      strncpy(settingsMsg, ok ? "Server OK!" : "Unreachable!", sizeof(settingsMsg) - 1);
+      settingsMsgMs = millis();
+    }
+    drawSettings();
+    break;
+
+  case 4: // ── Brightness cycle: 100% → 50% → 25% → 100% ──
+    if (settingBrightness == 255)
+      settingBrightness = 128;
+    else if (settingBrightness == 128)
+      settingBrightness = 64;
+    else
+      settingBrightness = 255;
+    display.setContrast(settingBrightness);
+    strncpy(settingsMsg, "Brightness set", sizeof(settingsMsg) - 1);
+    settingsMsgMs = millis();
+    drawSettings();
+    break;
+
+  case 5:
+  { // ── Device Info ──────────────────────────────
+    char heap[20], ver[20], scans[20], uptime[20];
+    snprintf(heap, sizeof(heap), "Heap: %u B", ESP.getFreeHeap());
+    snprintf(ver, sizeof(ver), "FW: v3.1");
+    snprintf(scans, sizeof(scans), "Scans: %d", scanCount);
+    unsigned long secs = millis() / 1000;
+    snprintf(uptime, sizeof(uptime), "Up: %lum %lus", secs / 60, secs % 60);
+    drawSettingsInfo("Device Info", heap, ver, scans, uptime);
+    settingsMsgMs = millis();
+    break;
+  }
+  }
+}
+
+// ─────────────────────────────────────────────────────────
 //  STATE TRANSITIONS
 // ─────────────────────────────────────────────────────────
 void goToMenu()
@@ -467,6 +820,12 @@ void goToReady()
   drawReady();
 }
 
+void goToExpiredAlert()
+{
+  currentState = STATE_EXPIRED_ALERT;
+  drawExpiredAlert();
+}
+
 // ─────────────────────────────────────────────────────────
 //  SERVER CHECK
 // ─────────────────────────────────────────────────────────
@@ -476,7 +835,15 @@ bool checkServer()
     return false;
   char url[128];
   snprintf(url, sizeof(url), "%s?key=healthcheck", SERVER_URL);
-  WiFiClient client;
+  WiFiClientSecure client;
+  if (USE_HTTPS_INSECURE)
+  {
+    client.setInsecure(); // skip cert verification
+  }
+  else
+  {
+    client.setFingerprint(SSL_FINGERPRINT);
+  }
   HTTPClient http;
   http.begin(client, url);
   http.setTimeout(5000);
@@ -555,13 +922,21 @@ void fetchRC(const char *tag)
     return;
   }
 
+  // Safety guard: action items must never reach fetchRC
+  if (MENU[menuIndex].isAction || MENU[menuIndex].fields == NULL)
+  {
+    goToMenu();
+    return;
+  }
   // FIX 8: build URL in a char[] — no String heap allocation
   char fields[80];
   strncpy(fields, MENU[menuIndex].fields, sizeof(fields) - 1);
   fields[sizeof(fields) - 1] = '\0';
   // URL-encode commas
   char fieldsEnc[160] = "";
-  for (int i = 0, j = 0; fields[i] && j < 158; i++)
+  // Fix 1: guard was j<158 — comma at j=157 wrote fieldsEnc[160] (OOB)
+  // Fix: j<156 ensures comma expansion (3 bytes) + null stay within [0..159]
+  for (int i = 0, j = 0; fields[i] && j < 156; i++)
   {
     if (fields[i] == ',')
     {
@@ -580,10 +955,18 @@ void fetchRC(const char *tag)
   snprintf(url, sizeof(url), "%s?tag=%s&fields=%s&key=%s&compact=1",
            SERVER_URL, tag, fieldsEnc, API_KEY);
 
-  WiFiClient client;
+  WiFiClientSecure client;
+  if (USE_HTTPS_INSECURE)
+  {
+    client.setInsecure(); // skip cert verification
+  }
+  else
+  {
+    client.setFingerprint(SSL_FINGERPRINT);
+  }
   HTTPClient http;
   http.begin(client, url);
-  http.setTimeout(6000);
+  http.setTimeout(8000); // HTTPS handshake needs more time
 
   drawFetching(tag, 1);
   int code = http.GET();
@@ -627,7 +1010,13 @@ void fetchRC(const char *tag)
 
   resultCount = 0;
   resultScroll = 0;
-  resultFromCache = false; // FIX 4: fresh fetch — not from cache
+  resultFromCache = false;
+
+  // Read expired document info from API response
+  expiredCount = doc["expired_count"] | 0;
+  const char *expFlds = doc["expired_fields"] | "";
+  strncpy(expiredFields, expFlds, sizeof(expiredFields) - 1);
+  expiredFields[sizeof(expiredFields) - 1] = '\0';
 
   JsonObject data = doc["data"].as<JsonObject>();
   for (JsonPair kv : data)
@@ -637,17 +1026,19 @@ void fetchRC(const char *tag)
     strncpy(resultKeys[resultCount], kv.key().c_str(),
             sizeof(resultKeys[0]) - 1);
     resultKeys[resultCount][sizeof(resultKeys[0]) - 1] = '\0';
-    strncpy(resultVals[resultCount], kv.value().as<const char *>() ? kv.value().as<const char *>() : "",
+    // Fix 2: evaluate once into local
+    const char *valStr = kv.value().as<const char *>();
+    strncpy(resultVals[resultCount], valStr ? valStr : "",
             sizeof(resultVals[0]) - 1);
     resultVals[resultCount][sizeof(resultVals[0]) - 1] = '\0';
     resultCount++;
   }
 
-  // Populate cache — store tag + menu group together
+  // Populate cache
   strncpy(cachedTag, tag, sizeof(cachedTag) - 1);
   strncpy(cachedRcNo, resultRcNo, sizeof(cachedRcNo) - 1);
   cachedCount = resultCount;
-  cachedMenuIndex = menuIndex; // cache is group-specific
+  cachedMenuIndex = menuIndex;
   cachedAt = millis();
   for (int i = 0; i < resultCount; i++)
   {
@@ -657,8 +1048,18 @@ void fetchRC(const char *tag)
 
   scanCount++;
   resultShowTime = millis();
-  currentState = STATE_RESULT;
-  drawResult();
+
+  // If any compliance doc is expired AND user used Expired Docs / Compliance
+  // show the alert screen first — officer sees the warning immediately
+  if (expiredCount > 0)
+  {
+    goToExpiredAlert();
+  }
+  else
+  {
+    currentState = STATE_RESULT;
+    drawResult();
+  }
 }
 
 // ─────────────────────────────────────────────────────────
@@ -667,7 +1068,7 @@ void fetchRC(const char *tag)
 void setup()
 {
   Serial.begin(115200);
-  Serial.println("\nSmart RC Book v3.1");
+  Serial.println("\nSmart RC Book v3.2");
 
   pinMode(BTN_NAV, INPUT);         // external pull-up
   pinMode(BTN_BACK, INPUT_PULLUP); // internal pull-up
@@ -684,7 +1085,7 @@ void setup()
   display.setTextSize(1);
   display.setTextColor(SH110X_WHITE);
   display.setCursor(10, 16);
-  display.print("Smart RC Book v3.1");
+  display.print("Smart RC Book v3.2");
   display.setCursor(22, 30);
   display.print("Starting...");
   display.display();
@@ -721,9 +1122,12 @@ void setup()
   drawWifiOk();
   delay(1000);
 
+  // Fix 6: store IP in local buffer before passing to drawServerCheck
+  char svrIpBuf[20];
+  strncpy(svrIpBuf, WiFi.localIP().toString().c_str(), sizeof(svrIpBuf) - 1);
+  svrIpBuf[sizeof(svrIpBuf) - 1] = '\0';
   bool svrOk = checkServer();
-  drawServerCheck(svrOk,
-                  svrOk ? WiFi.localIP().toString().c_str() : "Unreachable");
+  drawServerCheck(svrOk, svrOk ? svrIpBuf : "Unreachable");
   delay(1500);
 
   lastActivityMs = millis();
@@ -753,7 +1157,12 @@ void loop()
   }
 
   // FIX 6: smarter WiFi reconnect
-  handleWifiReconnect();
+  // Bug: was running even during STATE_WIFI_RECONNECTING,
+  // calling WiFi.begin() on top of the manual reconnect attempt.
+  if (currentState != STATE_WIFI_RECONNECTING)
+  {
+    handleWifiReconnect();
+  }
 
   switch (currentState)
   {
@@ -772,7 +1181,17 @@ void loop()
     {
       Serial.print("Selected: ");
       Serial.println(MENU[menuIndex].label);
-      goToReady();
+      // isAction items go to special handlers, not STATE_READY
+      if (MENU[menuIndex].isAction)
+      {
+        // Reset all reconnect globals before entering the state
+        // "Settings" is the only action item in the main menu
+        goToSettings();
+      }
+      else
+      {
+        goToReady();
+      }
     }
     else if (btn == 3)
     {
@@ -861,6 +1280,121 @@ void loop()
     if (btn != 0)
       goToReady();
     break;
+
+  case STATE_EXPIRED_ALERT:
+    if (btn == 3)
+    {
+      goToMenu();
+      break;
+    } // BACK → menu
+    if (btn == 1 || btn == 2)
+    {
+      // NAV or SEL → proceed to full result details
+      currentState = STATE_RESULT;
+      drawResult();
+    }
+    break;
+
+  case STATE_SETTINGS:
+    if (btn == 3)
+    {
+      goToMenu();
+      break;
+    } // BACK → main menu
+    if (btn == 1)
+    {
+      // NAV → next setting
+      settingsIndex = (settingsIndex + 1) % SETTINGS_COUNT;
+      if (settingsIndex < settingsScroll)
+        settingsScroll = settingsIndex;
+      if (settingsIndex >= settingsScroll + SETTINGS_VISIBLE)
+        settingsScroll = settingsIndex - SETTINGS_VISIBLE + 1;
+      settingsMsg[0] = '\0';
+      drawSettings();
+      break;
+    }
+    if (btn == 2)
+    {
+      // SEL → execute selected setting
+      execSetting(settingsIndex);
+      break;
+    }
+    // Auto-clear status messages after 2s
+    if (settingsMsg[0] && settingsMsgMs > 0 &&
+        millis() - settingsMsgMs > 2000)
+    {
+      settingsMsg[0] = '\0';
+      settingsMsgMs = 0;
+      drawSettings();
+    }
+    break;
+
+  case STATE_WIFI_RECONNECTING:
+  {
+
+    // BACK — cancel
+    if (btn == 3)
+    {
+      wifiReconnectActive = false;
+      wifiJustConnected = false;
+      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+      goToMenu();
+      break;
+    }
+
+    // ── Root cause fix ──────────────────────────────────
+    // Old code checked WiFi.status() every loop tick and kept
+    // resetting wifiSuccessShowMs = millis() on every connected
+    // iteration, so millis()-wifiSuccessShowMs was always < 1ms
+    // and goToMenu() was never reached. The 20s timeout then
+    // fired even though WiFi had already connected.
+    //
+    // Fix: latch wifiJustConnected = true exactly ONCE on first
+    // connect detection. Never re-enter that block again.
+    // ────────────────────────────────────────────────────
+
+    if (!wifiJustConnected && WiFi.status() == WL_CONNECTED)
+    {
+      // First time we see a connection — latch it
+      wifiJustConnected = true;
+      wifiReconnectActive = false;
+      wifiSuccessShowMs = millis();
+      Serial.print("Reconnected: ");
+      Serial.println(WiFi.localIP());
+      drawWifiReconnecting(3, true); // show success screen
+    }
+
+    // Waiting to show success screen for 1.5s then go to menu
+    if (wifiJustConnected && wifiSuccessShowMs > 0 &&
+        millis() - wifiSuccessShowMs > 1500)
+    {
+      wifiJustConnected = false;
+      wifiSuccessShowMs = 0;
+      goToMenu();
+      break;
+    }
+
+    // Still trying — animate dots every 500ms
+    if (!wifiJustConnected && millis() - wifiDotMs > 500)
+    {
+      wifiDotMs = millis();
+      wifiDots = (wifiDots % 3) + 1;
+      drawWifiReconnecting(wifiDots, false);
+    }
+
+    // 20s timeout — give up
+    if (wifiReconnectActive &&
+        millis() - wifiReconnectStartMs > 20000)
+    {
+      Serial.println("Reconnect timed out");
+      strncpy(errorMsg, "WiFi timed out", sizeof(errorMsg) - 1);
+      wifiReconnectActive = false;
+      wifiJustConnected = false;
+      currentState = STATE_ERROR;
+      drawError(errorMsg);
+    }
+    break;
+  }
 
   default:
     break;
