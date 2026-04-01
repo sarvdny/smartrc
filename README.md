@@ -14,7 +14,7 @@
   > - **Prof. Pradeep Taware [ Subject Teacher : Micro Project ]**
 
 ---
-**Abstract:** 
+# Abstract:
 
 Smart RC Book is an IoT-based vehicle Registration Certificate verification system designed to modernise roadside document checking for traffic police and RTO enforcement officers in India. The system addresses a critical operational gap in the existing verification infrastructure, where officers rely on physical paper documents that can be forged, damaged, or withheld, and where existing digital solutions such as mParivahan require internet-connected smartphones that junior-level constables rarely have access to during field duty.
 
