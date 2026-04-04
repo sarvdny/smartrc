@@ -2,7 +2,7 @@
 
 ---
 
-- The project **RFID Based Smart RC Book** Is under the subject named **Micro Project** by the **Tech Titans** which includes the members :
+- The project **RFID Based Smart RC Book** Is under the subject named **Micro Project** by the **Tech Titans** which includes the member :
   > - **Sarvdny Potfode**
 ---
 # Abstract:
