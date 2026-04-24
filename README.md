@@ -3,10 +3,10 @@
 ---
 
 - The project **RFID Based Smart RC Book** Is under the subject named **Micro Project** by the **Tech Titans** which includes the member :
-  > - **Sarvdny Potfode  [ SY D-11 ]**
-  > - **Siraj Sayed [ SY D-12 ]**
-  > - **Nandini Panchal [ SY D-13 ]**
-  > - **Priti Satvekar [ SY D-14 ]**
+  > - **Sarvdny Potfode    [ SY D-11 ]**
+  > - **Siraj Sayed        [ SY D-12 ]**
+  > - **Nandini Panchal    [ SY D-13 ]**
+  > - **Priti Satvekar     [ SY D-14 ]**
 
 >
 
